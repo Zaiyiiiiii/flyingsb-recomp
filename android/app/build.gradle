@@ -1,0 +1,101 @@
+plugins {
+    id 'com.android.application'
+}
+
+// 项目根目录（android/ 的上一级）
+def root = rootProject.projectDir.parentFile
+// SDL / FreeType 源码：复用其他平台构建时 FetchContent 已下载的，避免重复克隆；可用 -PsdlDir= / -PftDir= 指定
+def sdlDir = file(project.findProperty('sdlDir') ?: "${root}/build/win/_deps/sdl3-src")
+def ftDir = file(project.findProperty('ftDir') ?: "${root}/build/win/_deps/freetype-src")
+// 重编译生成的 C 代码与平台无关，可复用
+def genDir = file(project.findProperty('genDir') ?: "${root}/build/win/gen")
+def iconRes = file("${genDir}/res")
+def abis = ['arm64-v8a', 'x86_64']
+
+if (!new File(sdlDir, 'android-project').exists()) {
+    throw new GradleException("找不到 SDL 源码: ${sdlDir}\n请先构建一次其他平台（会下载 SDL），或用 -PsdlDir=<路径> 指定。")
+}
+
+android {
+    namespace 'wang.zaiyi.flyingsb'
+    compileSdk 35
+    ndkVersion '25.2.9519653'
+
+    defaultConfig {
+        applicationId 'wang.zaiyi.flyingsb'
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+        ndk { abiFilters(*abis) }
+        // 启动图标由重编译步骤从原版 exe 提取到 genDir/res；没有时用系统默认图标
+        manifestPlaceholders = [appIcon: iconRes.exists() ? '@mipmap/ic_launcher' : '@android:drawable/sym_def_app_icon']
+    }
+
+    sourceSets {
+        main {
+            res.srcDirs = ['src/main/res', iconRes]
+            java.srcDirs = ['src/main/java', "${sdlDir}/android-project/app/src/main/java"]
+            jniLibs.srcDirs = ["${buildDir}/jniLibs"]
+            // 包内只带宋体（游戏数据由用户在启动页选择，运行时导入）
+            assets.srcDirs = ["${buildDir}/generated-assets"]
+        }
+    }
+
+    androidResources {
+        noCompress.add('ttc')
+    }
+
+    buildTypes {
+        release {
+            signingConfig signingConfigs.debug   // 自用测试包，直接用调试签名
+        }
+    }
+}
+
+// ---- 中文字体 ----
+def generatedAssets = file("${buildDir}/generated-assets")
+tasks.register('generateGameManifest') {
+    inputs.file("${root}/fonts/simsun.ttc").optional()
+    outputs.dir(generatedAssets)
+    doLast {
+        generatedAssets.mkdirs()
+        // 中文字体（宋体）：Android 没有 simsun，随包带上
+        def font = new File(root, 'fonts/simsun.ttc')
+        if (font.exists()) {
+            copy { from font; into new File(generatedAssets, 'fonts') }
+        } else {
+            logger.warn("未找到 ${font}：包内没有宋体，将只用系统自带的中日韩字体。")
+        }
+    }
+}
+
+// ---- 原生库：用 NDK 的 CMake 工具链按 ABI 构建 libmain.so + libSDL3.so ----
+def ndkRoot = "${android.sdkDirectory}/ndk/${android.ndkVersion}"
+abis.each { abi ->
+    def bdir = file("${root}/build/android-${abi}")
+    def cfg = tasks.register("nativeConfigure_${abi}", Exec) {
+        inputs.dir("${root}/runtime"); inputs.dir("${root}/platform"); inputs.file("${root}/CMakeLists.txt")
+        outputs.file("${bdir}/build.ninja")
+        commandLine 'cmake', '-S', root.toString(), '-B', bdir.toString(), '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release',
+            "-DCMAKE_TOOLCHAIN_FILE=${ndkRoot}/build/cmake/android.toolchain.cmake",
+            "-DANDROID_ABI=${abi}", '-DANDROID_PLATFORM=android-24',
+            "-DGEN_DIR=${genDir}",
+            "-DFETCHCONTENT_SOURCE_DIR_SDL3=${sdlDir}",
+            "-DFETCHCONTENT_SOURCE_DIR_FREETYPE=${ftDir}",
+            '-DFETCHCONTENT_FULLY_DISCONNECTED=ON'
+    }
+    def build = tasks.register("nativeBuild_${abi}", Exec) {
+        dependsOn cfg
+        commandLine 'cmake', '--build', bdir.toString()
+    }
+    def collect = tasks.register("nativeCollect_${abi}", Copy) {
+        dependsOn build
+        from(fileTree(bdir) { include '**/libmain.so', '**/libSDL3.so' }) { eachFile { path = name } }
+        into "${buildDir}/jniLibs/${abi}"
+        includeEmptyDirs = false
+    }
+    tasks.named('preBuild') { dependsOn collect }
+}
+tasks.named('preBuild') { dependsOn 'generateGameManifest' }

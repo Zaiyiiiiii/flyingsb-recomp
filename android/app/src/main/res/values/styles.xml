@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 游戏：全屏、无标题栏 -->
+    <style name="AppTheme" parent="@android:style/Theme.NoTitleBar.Fullscreen" />
+    <!-- 启动页：普通界面，跟随系统深浅色 -->
+    <style name="LauncherTheme" parent="@android:style/Theme.DeviceDefault.NoActionBar" />
+</resources>

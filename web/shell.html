@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>幻想西游记 · 重编译版</title>
+<style>
+  :root { color-scheme: dark; --bg: #0b0b0e; --fg: #d8d8de; --dim: #8a8a95; --accent: #e0a040; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.5 system-ui, "Microsoft YaHei", sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 16px; box-sizing: border-box; }
+  /* --arn 是画面宽高比（数值），由游戏线程每次分辨率变化时写入；游戏宽屏(16:9)时画面比例随之变化 */
+  #stage { --arn: 1.3333; position: relative; width: min(100%, calc((100vh - 90px) * var(--arn))); aspect-ratio: var(--arn); background: #000; }
+  /* SDL 会给 canvas 写内联的像素尺寸，这里强制由布局决定显示大小 */
+  canvas { width: 100% !important; height: 100% !important; display: block; outline: none; image-rendering: auto; }
+  /* 全屏：浏览器会强制全屏元素 100%×100%，所以把舞台当黑底容器，canvas 按 4:3 取最大尺寸居中，不拉伸 */
+  #stage:fullscreen { display: flex; align-items: center; justify-content: center; background: #000; aspect-ratio: auto; }
+  #stage:fullscreen canvas {
+    width: min(100vw, calc(100vh * var(--arn))) !important;
+    height: min(100vh, calc(100vw / var(--arn))) !important;
+  }
+  #stage:fullscreen #overlay { position: absolute; }
+  #overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; text-align: center; pointer-events: none; padding: 16px; }
+  #overlay.hidden { display: none; }
+  #status { color: var(--dim); }
+  #error { color: #ff7b72; white-space: pre-wrap; }
+  #hint { color: var(--dim); font-size: 12px; text-align: center; }
+  #fs { background: #1b1b22; color: var(--fg); border: 1px solid #3a3a46; border-radius: 6px; padding: 4px 16px; font: inherit; cursor: pointer; }
+  #fs:hover { border-color: var(--accent); }
+  kbd { border: 1px solid #444; border-radius: 3px; padding: 0 4px; }
+</style>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+    <div id="overlay"><div id="status">正在加载…</div><div id="error"></div></div>
+  </div>
+  <button id="fs" type="button" title="全屏 (F11 / Alt+Enter / 手柄右摇杆按下)">全屏</button>
+  <div id="hint">方向键移动 · <kbd>Enter</kbd>/<kbd>X</kbd> 确认 · <kbd>Esc</kbd>/<kbd>Z</kbd> 取消 · <kbd>D</kbd> 切换队伍 · 支持手柄 · <kbd>F11</kbd> 全屏</div>
+<script>
+  const overlay = document.getElementById('overlay');
+  const statusEl = document.getElementById('status');
+  const errorEl = document.getElementById('error');
+  const q = new URLSearchParams(location.search);
+  const args = [];
+  if (q.has('skip-video')) args.push('--skip-video');
+  if (q.has('trace')) args.push('--trace-api');
+  if (q.has('cheat')) args.push('--cheat');
+
+  var Module = {
+    arguments: args,
+    canvas: document.getElementById('canvas'),
+    print: (t) => console.log(t),
+    printErr: (t) => {
+      console.warn(t);
+      if (/致命|fatal/i.test(t)) { errorEl.textContent += t + '\n'; overlay.classList.remove('hidden'); }
+    },
+    setStatus: (t) => { statusEl.textContent = t || ''; if (!t) overlay.classList.add('hidden'); },
+    onAbort: (w) => { errorEl.textContent += '程序中止: ' + w + '\n'; overlay.classList.remove('hidden'); },
+    preRun: [function () {
+      // 存档目录 /save 用浏览器 IndexedDB 持久化
+      FS.mkdir('/save');
+      FS.mount(IDBFS, {}, '/save');
+      addRunDependency('idbfs');
+      FS.syncfs(true, function () { removeRunDependency('idbfs'); });
+      setInterval(function () { FS.syncfs(false, function () {}); }, 5000);
+      addEventListener('beforeunload', function () { FS.syncfs(false, function () {}); });
+    }],
+  };
+  if (!self.crossOriginIsolated) {
+    errorEl.textContent = '页面没有跨源隔离（缺少 COOP/COEP 响应头），无法使用线程。请通过本项目的 Rust 服务器打开本页面。';
+  }
+  // 全屏整个舞台容器（保持 4:3 居中）。按钮、F11、Alt+Enter 共用；手柄不算浏览器的"用户操作"，进入全屏可能被浏览器拒绝，退出不受限
+  Module.toggleFullscreen = function () {
+    const stage = document.getElementById('stage');
+    if (document.fullscreenElement) document.exitFullscreen();
+    else stage.requestFullscreen().catch(() => {});
+  };
+  document.getElementById('fs').addEventListener('click', () => { Module.toggleFullscreen(); focusCanvas(); });
+
+  // ---- 键盘：整页有效，不依赖 canvas 焦点，也不受中文输入法影响 ----
+  // 不用 SDL 的键盘（它依赖 canvas 焦点；输入法开着时事件变成 key="Process"，SDL 认不出）。
+  // 这里在 window 捕获阶段按物理键位 event.code 映射成 Win32 虚拟键码——输入法开着时 code 依然准确——
+  // 再经共享内存环形队列交给游戏线程（C 端 plat_pump_events 取走）。
+  // 队列字：type<<24 | down<<16 | 值。type: 0=按键(VK) 1=字符(Unicode) 2=松开所有键 3=窗口激活/失活(down)
+  Module.installInput = function (ring, headp, tailp, videop) {
+    const N = 256;
+    const vkOf = new Map();
+    ('ArrowLeft:37;ArrowUp:38;ArrowRight:39;ArrowDown:40;Enter:13;NumpadEnter:13;Space:32;Escape:27;Tab:9;Backspace:8;' +
+     'ShiftLeft:16;ShiftRight:16;ControlLeft:17;ControlRight:17;AltLeft:18;AltRight:18;CapsLock:20;' +
+     'PageUp:33;PageDown:34;End:35;Home:36;Insert:45;Delete:46;' +
+     'NumpadAdd:107;NumpadSubtract:109;NumpadMultiply:106;NumpadDivide:111;NumpadDecimal:110;' +
+     'Minus:189;Equal:187;Comma:188;Period:190;Slash:191;Semicolon:186;Quote:222;BracketLeft:219;BracketRight:221;Backslash:220;Backquote:192')
+      .split(';').forEach((s) => { const p = s.split(':'); vkOf.set(p[0], +p[1]); });
+    for (let i = 0; i < 26; i++) vkOf.set('Key' + String.fromCharCode(65 + i), 65 + i);
+    for (let i = 0; i < 10; i++) { vkOf.set('Digit' + i, 48 + i); vkOf.set('Numpad' + i, 96 + i); }
+    for (let i = 1; i <= 12; i++) vkOf.set('F' + i, 111 + i);
+
+    const push = (type, down, value) => {
+      const H = Module.HEAP32;
+      const tail = Atomics.load(H, tailp >> 2);
+      const head = Atomics.load(H, headp >> 2);
+      if (((tail - head) >>> 0) >= N) return;                       // 队列满了就丢弃
+      Module.HEAPU32[(ring >> 2) + (tail & (N - 1))] = ((type << 24) | (down << 16) | (value & 0xFFFF)) >>> 0;
+      Atomics.store(H, tailp >> 2, (tail + 1) | 0);
+    };
+    const toggleFullscreen = () => Module.toggleFullscreen();
+    // 这些键不要被页面吞掉，留给浏览器（刷新、开发者工具）
+    const passthrough = (e) => e.ctrlKey || e.metaKey || e.code === 'F5' || e.code === 'F12';
+
+    addEventListener('keydown', (e) => {
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.code === 'F11' || (e.altKey && e.code === 'Enter')) { e.preventDefault(); if (!e.repeat) toggleFullscreen(); return; }
+      const vk = vkOf.get(e.code);
+      if (!vk) return;
+      const isMod = vk === 16 || vk === 17 || vk === 18;
+      if (passthrough(e) && !isMod) return;
+      push(0, 1, vk);
+      // 字符消息只在没有输入法组合时发（输入法开着 e.key 是 "Process"，这里自然不会发）
+      if (!e.isComposing && e.key && e.key.length === 1 && e.key.charCodeAt(0) < 128 && !e.ctrlKey && !e.metaKey) push(1, 1, e.key.charCodeAt(0));
+      e.preventDefault();
+    }, true);
+    addEventListener('keyup', (e) => {
+      const vk = vkOf.get(e.code);
+      if (!vk) return;
+      push(0, 0, vk);                                               // 松开总是转发，避免卡键
+      if (!passthrough(e)) e.preventDefault();
+    }, true);
+
+    // ---- 手柄：直接读浏览器 Gamepad API 的"标准布局"，不经过 SDL 的重新映射（它在浏览器里会把按钮错位）----
+    // 标准布局下标: 0=A 1=B 2=X 3=Y 4=LB 5=RB 8=SELECT 9=START 10=L3 11=R3 12=上 13=下 14=左 15=右
+    // 值为 Win32 虚拟键码；0x1000 表示"切换全屏"
+    const PAD_MAP = new Map([[0, 13], [1, 27], [2, 32], [3, 77], [4, 67], [5, 68], [8, 13], [9, 27], [11, 0x1000],
+                             [12, 38], [13, 40], [14, 37], [15, 39]]);
+    // 播放片头视频时，这些按钮都当作 Esc（原版只能用 Esc 跳过）：A B X Y SELECT START
+    const PAD_SKIP = new Set([0, 1, 2, 3, 8, 9]);
+    const DIR_VK = [37, 39, 38, 40];                                // 左 右 上 下
+    const counts = new Int32Array(256);                             // 多个来源按住同一个键时的计数
+    const press = (vk, down) => {
+      if (down) { if (counts[vk]++ === 0) push(0, 1, vk); }
+      else if (counts[vk] > 0 && --counts[vk] === 0) push(0, 0, vk);
+    };
+    const padState = new Map();                                     // 手柄序号 -> { down:{按钮:0/1}, vk:{按钮:键}, dir:[0,0,0,0] }
+    const stateOf = (i) => { let s = padState.get(i); if (!s) { s = { down: {}, vk: {}, dir: [0, 0, 0, 0] }; padState.set(i, s); } return s; };
+    const releasePad = (i) => {
+      const s = padState.get(i);
+      if (!s) return;
+      for (const b in s.down) if (s.down[b]) { s.down[b] = 0; if (s.vk[b] !== 0x1000) press(s.vk[b], 0); }
+      for (let d = 0; d < 4; d++) if (s.dir[d]) { s.dir[d] = 0; press(DIR_VK[d], 0); }
+    };
+    const pollPads = () => {
+      requestAnimationFrame(pollPads);
+      const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+      const playing = Atomics.load(Module.HEAP32, videop >> 2) > 0;
+      for (const gp of pads) {
+        if (!gp || !gp.connected) continue;
+        const s = stateOf(gp.index);
+        PAD_MAP.forEach((vkDefault, idx) => {
+          const b = gp.buttons[idx];
+          const d = b ? (b.pressed || b.value > 0.5) : false;
+          if (d && !s.down[idx]) {
+            s.down[idx] = 1;
+            const vk = (playing && PAD_SKIP.has(idx)) ? 27 : vkDefault;
+            s.vk[idx] = vk;
+            if (vk === 0x1000) Module.toggleFullscreen(); else press(vk, 1);
+          } else if (!d && s.down[idx]) {
+            s.down[idx] = 0;
+            if (s.vk[idx] !== 0x1000) press(s.vk[idx], 0);
+          }
+        });
+        // 左摇杆当方向键（滞回死区：按下 0.5，释放 0.3）
+        const ax = gp.axes[0] || 0;
+        const ay = gp.axes[1] || 0;
+        const want = [ax < (s.dir[0] ? -0.3 : -0.5), ax > (s.dir[1] ? 0.3 : 0.5), ay < (s.dir[2] ? -0.3 : -0.5), ay > (s.dir[3] ? 0.3 : 0.5)];
+        for (let d = 0; d < 4; d++) {
+          const w = want[d] ? 1 : 0;
+          if (w !== s.dir[d]) { s.dir[d] = w; press(DIR_VK[d], w); }
+        }
+      }
+    };
+    addEventListener('gamepaddisconnected', (e) => releasePad(e.gamepad.index));
+    requestAnimationFrame(pollPads);
+
+    const releaseAll = () => { push(2, 0, 0); push(3, 0, 0); };
+    addEventListener('blur', releaseAll);
+    addEventListener('focus', () => push(3, 1, 0));
+    document.addEventListener('visibilitychange', () => { if (document.hidden) releaseAll(); else push(3, 1, 0); });
+  };
+
+  // 鼠标点击仍把焦点交给 canvas（鼠标事件由 SDL 经 canvas 处理）
+  const focusCanvas = () => { try { if (document.activeElement !== Module.canvas) Module.canvas.focus({ preventScroll: true }); } catch (e) {} };
+  document.getElementById('stage').addEventListener('pointerdown', focusCanvas);
+  focusCanvas();
+</script>
+{{{ SCRIPT }}}
+</body>
+</html>

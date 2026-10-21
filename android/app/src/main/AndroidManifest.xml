@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:glEsVersion="0x00020000" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false" />
+    <uses-feature android:name="android.hardware.gamepad" android:required="false" />
+
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:label="幻想西游记"
+        android:icon="${appIcon}"
+        android:allowBackup="true"
+        android:hardwareAccelerated="true"
+        android:theme="@style/AppTheme">
+
+        <!-- 启动页：竖屏，选择游戏 ZIP / 目录 -->
+        <activity
+            android:name=".LauncherActivity"
+            android:exported="true"
+            android:screenOrientation="portrait"
+            android:theme="@style/LauncherTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 把应用的文件目录交给系统的"文件"应用，无需存储权限即可浏览、复制、替换 -->
+        <provider
+            android:name=".FilesProvider"
+            android:authorities="wang.zaiyi.flyingsb.files"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
+        <!-- 游戏：横屏 -->
+        <activity
+            android:name=".FlyingSBActivity"
+            android:exported="false"
+            android:screenOrientation="sensorLandscape"
+            android:launchMode="singleTask"
+            android:configChanges="layoutDirection|locale|orientation|uiMode|screenLayout|screenSize|smallestScreenSize|keyboard|keyboardHidden|navigation" />
+    </application>
+</manifest>

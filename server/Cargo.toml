@@ -1,0 +1,14 @@
+[package]
+name = "flyingsb-server"
+version = "0.1.0"
+edition = "2021"
+description = "FlyingSB 重编译版的 Web 服务器：托管 WASM 客户端，并把用户本地的游戏目录经 HTTP(Range) 提供给浏览器"
+
+[dependencies]
+axum = "0.8"
+axum-server = { version = "0.8.0", features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std", "tls12"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "net"] }
+tokio-util = { version = "0.7", features = ["io"] }
+tower-http = { version = "0.6", features = ["fs", "set-header"] }
+x509-parser = "0.18.1"
